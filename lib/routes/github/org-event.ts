@@ -132,7 +132,7 @@ async function handler(ctx) {
         },
     });
 
-    const items = filterEvents(types, response.data);
+    const items = await filterEvents(types, response.data, headers);
     const typeFilter = types === 'all' ? 'All Events' : `Events: ${types}`;
 
     return {

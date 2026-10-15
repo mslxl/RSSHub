@@ -1,6 +1,10 @@
 import { escapeAttribute, escapeText } from 'entities';
 import MarkdownIt from 'markdown-it';
+import pMap from 'p-map';
 
+import cache from '@/utils/cache';
+import got from '@/utils/got';
+import logger from '@/utils/logger';
 import { parseDate } from '@/utils/parse-date';
 
 const md = MarkdownIt({ html: true, linkify: true });
@@ -24,12 +28,31 @@ export const eventTypeMapping = {
     cmcomm: 'CommitCommentEvent',
 };
 
-function formatEventItem(event: any) {
+async function getPullRequestDetails(event: any, headers: Record<string, string>) {
+    const number = event.payload.number ?? event.payload.pull_request?.number;
+    if (!number) {
+        return;
+    }
+
+    const url = `https://api.github.com/repos/${event.repo.name}/pulls/${number}`;
+    try {
+        const pullRequest = await cache.tryGet(url, async () => {
+            const { data } = await got(url, { headers });
+            return data;
+        });
+        return pullRequest;
+    } catch (error) {
+        logger.warn(`Unable to retrieve PR details for ${event.repo.name}#${number}: ${error}`);
+    }
+}
+
+async function formatEventItem(event: any, headers: Record<string, string>) {
     const { id, type, actor, repo, payload, created_at } = event;
 
     let title: string;
     let description: string;
     let link: string;
+    let author: string | undefined = actor.login;
 
     switch (type) {
         case 'PushEvent': {
@@ -49,6 +72,15 @@ function formatEventItem(event: any) {
         }
         case 'PullRequestEvent':
             title = `${actor.login} ${payload.action} a pull request in ${repo.name}`;
+            if (payload.action === 'merged') {
+                // Merged event actors can be PR authors; PR details identify the merger.
+                const pullRequest = await getPullRequestDetails(event, headers);
+                author = pullRequest?.merged_by?.login;
+                const pullRequestAuthor = pullRequest?.user?.login;
+                const number = pullRequest?.number ?? payload.number ?? payload.pull_request?.number;
+                const reference = `pull request${number ? ` #${number}` : ''}`;
+                title = author ? `${author} merged ${pullRequestAuthor ? `${pullRequestAuthor}'s` : 'a'} ${reference} in ${repo.name}` : `${pullRequestAuthor ? `${pullRequestAuthor}'s` : 'A'} ${reference} was merged in ${repo.name}`;
+            }
             if (payload.pull_request) {
                 link = payload.pull_request.url.replace(/https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)/, 'https://github.com/$1/$2/pull/$3');
                 description = escapeText(`PR: ${link}`);
@@ -144,13 +176,13 @@ function formatEventItem(event: any) {
         link,
         description,
         pubDate: parseDate(created_at),
-        author: actor.login,
+        author,
         category: [type],
         guid: id,
     };
 }
 
-export function filterEvents(types: string, data: any) {
+export function filterEvents(types: string, data: any, headers: Record<string, string>) {
     // Parse requested event types and map short names to full event types
     let filteredEventTypes: string[] = [];
     if (types !== 'all') {
@@ -159,5 +191,6 @@ export function filterEvents(types: string, data: any) {
             return eventTypeMapping[trimmedType] || trimmedType;
         });
     }
-    return data.filter((event) => filteredEventTypes.length === 0 || filteredEventTypes.includes(event.type)).map((event) => formatEventItem(event));
+    const events = data.filter((event) => filteredEventTypes.length === 0 || filteredEventTypes.includes(event.type));
+    return pMap(events, (event) => formatEventItem(event, headers), { concurrency: 5 });
 }
